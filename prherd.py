@@ -605,11 +605,15 @@ def load_settings():
     except (OSError, ValueError) as e:  # exit rather than let the next save overwrite it
         sys.exit(f"can't read saved settings {CONFIG}: {e}; fix or delete it")
     repos, interval, geometry = s.get("repos"), s.get("interval"), s.get("geometry")
-    view, sidebar = s.get("view"), s.get("sidebar")
+    view, sidebar, inactive = s.get("view"), s.get("sidebar"), s.get("inactive")
     text = lambda value, pattern: isinstance(value, str) and re.fullmatch(pattern, value)
+    # Saved repos are resolved: host/owner/repo. Anything else would be a row the window can't tell from a PR's.
+    repos = [r for r in repos if text(r, REPO_FORM)] if isinstance(repos, list) else []
     return {
-        # Saved repos are resolved: host/owner/repo. Anything else would be a row the window can't tell from a PR's.
-        "repos": [r for r in repos if text(r, REPO_FORM)] if isinstance(repos, list) else [],
+        "repos": repos,
+        # The repos that stay listed but aren't polled, and whether the sidebar lists them or only says how many.
+        "inactive": [r for r in repos if r in inactive] if isinstance(inactive, list) else [],
+        "inactive_open": s.get("inactive_open") is not False,
         "mode": s.get("mode") if s.get("mode") in [v for _, v in MODES] else "",
         "interval": interval if type(interval) is int and 0 < interval <= MAX_INTERVAL else 60,
         "merging": s.get("merging", True) is True,  # merging is the one to be sure of: "false" or 0 isn't a yes
@@ -1001,11 +1005,13 @@ def theme(root, dark, appearance="system"):
     s.map("Row.Side.TFrame", background=lit)
     s.map("Row.Side.TLabel", background=lit)
     s.map("Name.Row.Side.TLabel", font=[("selected", f["bold"])])
+    s.configure("Idle.Name.Row.Side.TLabel", foreground=p["muted"])  # an inactive repo's name
     s.configure("Sub.Row.Side.TLabel", foreground=p["muted"], font=f["small"])
     s.configure("Count.Row.Side.TLabel", foreground=p["muted"], font=f["mono"])
     s.configure("Caps.Side.TLabel", foreground=p["muted"], font=f["caps"])
     s.configure("Avatar.Side.TLabel", foreground="#FFFFFF", font=f["caps"])
     button("Side.TButton", p["side"], p["text-3"], p["side"], p["side-hover"], padding=4)
+    button("Caps.Side.TButton", p["side"], p["muted"], p["side"], p["side-hover"], font=f["caps"], padding=(4, 3))
     # The selection bar is the primary button's ink, with buttons outlined in a faint version of its paper.
     button("Sel.TButton", p["inv"], p["inv-fg"], mix(p["inv"], p["inv-fg"], 0.25), mix(p["inv"], p["inv-fg"], 0.14),
            padding=(8, 4))
@@ -1748,6 +1754,8 @@ class App:
         root.minsize(780, 480)
         self.events = queue.Queue()  # worker threads never touch tk; they post here
         self.repos = []
+        # The repos that are listed but not polled, until set active again. Workers read it: see watching().
+        self.inactive, self.inactive_open = set(saved["inactive"]), saved["inactive_open"]
         self.rows = {}  # repo -> [(pr, verdict)] from its last poll that could list them
         self.failed = set()  # the repos whose latest poll couldn't
         self.prs = {}  # tree row -> its PR as of the last poll
@@ -1956,16 +1964,26 @@ class App:
         self.repo_list = ttk.Frame(inner, style="Side.TFrame")
         self.repo_list.pack(fill="x")
         self.repo_rows = {}  # repo -> its row; render() keeps them in step with self.repos
+        self.listed = ([], [])  # the active and the inactive repos those rows were made for
+        # The inactive repos, in a group of their own that folds away to its heading. show_sidebar() packs it
+        # while there are any.
+        head = self.idle_head = ttk.Frame(inner, style="Side.TFrame")
+        self.idle_fold = ttk.Button(head, text="INACTIVE", compound="left", style="Caps.Side.TButton",
+                                    takefocus=False, command=self.toggle_inactive)
+        self.idle_fold.pack(side="left", padx=(2, 0))
+        self.idle_count = ttk.Label(head, style="Count.Row.Side.TLabel")
+        self.idle_count.pack(side="right", padx=(8, 10))
+        self.idle_list = ttk.Frame(inner, style="Side.TFrame")
 
-    def side_row(self, parent, image, text, sub=None, click=None, menu=None):
+    def side_row(self, parent, image, text, sub=None, click=None, menu=None, name="Name"):
         """A sidebar row: an icon, a name (over a smaller line, given sub) and a count. Its style lights it while
-        the pointer is over it, and while it's the one chosen (see lit())."""
+        the pointer is over it, and while it's the one chosen (see lit()). name picks the name's style."""
         row = ttk.Frame(parent, style="Row.Side.TFrame", padding=(8, 6 if sub is None else 4))
         row.pack(fill="x", pady=1)
         row.columnconfigure(1, weight=1)
         row.icon = ttk.Label(row, image=image, style="Row.Side.TLabel")
         row.icon.grid(row=0, column=0, rowspan=2, padx=(0, 10))
-        ttk.Label(row, text=text, style="Name.Row.Side.TLabel").grid(row=0, column=1, sticky="ew")
+        ttk.Label(row, text=text, style=f"{name}.Row.Side.TLabel").grid(row=0, column=1, sticky="ew")
         if sub is not None:
             ttk.Label(row, text=sub, style="Sub.Row.Side.TLabel").grid(row=1, column=1, sticky="ew")
         row.count = ttk.Label(row, style="Count.Row.Side.TLabel")
@@ -2069,11 +2087,15 @@ class App:
         tree.bind("<Configure>", fit)
         # Said in place of the rows when there are none to show.
         self.empty = ttk.Frame(table)
-        ttk.Label(self.empty, image=self.icon("check", "faint", 28)).pack(pady=(0, 6))
+        self.empty_icon = ttk.Label(self.empty)  # render() picks it: nothing to do, or nothing polled
+        self.empty_icon.pack(pady=(0, 6))
         self.empty_title = ttk.Label(self.empty, style="Bold.TLabel")
         self.empty_title.pack()
         self.empty_text = ttk.Label(self.empty, style="Muted.TLabel")
         self.empty_text.pack(pady=(2, 0))
+        # Under them while the one repo picked in the sidebar is inactive: render() packs it.
+        self.wake_button = ttk.Button(self.empty, text="Set active",
+                                      command=lambda: self.set_active([self.only], True))
 
         tree.bind("<<TreeviewSelect>>", self.show_selection)
         # A repo row keeps double-click for expanding and collapsing.
@@ -2126,6 +2148,8 @@ class App:
         menu.add_command(label="Copy link", command=lambda: self.copy_links(self.menu_repos))
         menu.add_command(label="Refresh", command=lambda: [self.bg(self.refresh, repo) for repo in self.menu_repos])
         menu.add_separator()
+        menu.add_command(label="Set inactive", command=lambda: self.set_active(self.menu_repos, False))
+        menu.add_command(label="Set active", command=lambda: self.set_active(self.menu_repos, True))
         menu.add_command(label="Remove repo", command=lambda: self.remove(self.menu_repos))
 
     # Small parts the builders share.
@@ -2177,6 +2201,10 @@ class App:
 
     def dot(self, color, size):
         return self.image(("dot", color, size), lambda p: draw(((p[color], 24, ((12, 12, 12, 12),)),), size, size))
+
+    def ring(self, color, size):
+        """A dot's outline, the same size: what stands for a repo that isn't polled."""
+        return self.image(("ring", color, size), lambda p: draw(((p[color], 5, (("o", 12, 12, 9),)),), size, size))
 
     def switch(self, on):
         """Auto-merge's switch: a pill, in the accent with its knob to the right when on."""
@@ -2237,7 +2265,7 @@ class App:
         tree.delete(*tree.get_children())
         self.prs, self.verdicts = {}, {}
         shown = 0
-        for repo in self.repos:
+        for repo in self.watched():  # an inactive repo has no pull requests to list: it's in the sidebar's group
             rows = self.rows.get(repo, [])
             for pr, v in rows:
                 self.prs[f"{repo}#{pr['number']}"], self.verdicts[f"{repo}#{pr['number']}"] = pr, v
@@ -2262,15 +2290,22 @@ class App:
         view = VIEWS[self.view]["label"]  # the heading: the view, the picked repo, or both
         self.title.configure(text=view if not self.only else short(self.only) if self.view == "all" else
                              f"{short(self.only)} · {view}")
+        idle = self.only in self.inactive  # the one repo picked is inactive: say so, and offer to watch it again
         self.subtitle.configure(text=(
-            "No repositories yet" if not self.repos else "No open pull requests" if not shown else
+            "No repositories yet" if not self.repos else "Inactive · not polled" if idle else
+            "No open pull requests" if not shown else
             f"{shown} open in {groups} repositor{'y' if groups == 1 else 'ies'}")
             + (f" · matching “{query.strip()}”" if query.split() else ""))
         if groups or not self.repos:  # with no repos, the first run is shown where the table is
             self.empty.place_forget()
         else:
-            self.empty_title.configure(text="Nothing here")
-            self.empty_text.configure(text="No open pull requests match this view.")
+            title, text = (("Inactive", "prherd isn't polling this repository.") if idle else
+                           ("Nothing is polled", "Every repository is inactive.") if not self.watched() else
+                           ("Nothing here", "No open pull requests match this view."))
+            self.empty_icon.configure(image=self.icon("pause" if title != "Nothing here" else "check", "faint", 28))
+            self.empty_title.configure(text=title)
+            self.empty_text.configure(text=text)
+            self.wake_button.pack(pady=(12, 0)) if idle else self.wake_button.pack_forget()
             self.empty.place(relx=0.5, rely=0.45, anchor="center")
         self.show_sidebar()
         self.tell("repos")
@@ -2283,24 +2318,35 @@ class App:
             listed = VIEWS[key]["verdicts"]
             row.count.configure(text=sum(listed is None or v in listed for v in scope))
             self.lit(row, key == self.view)
-        if list(self.repo_rows) != self.repos:  # a repo came or went: make its rows afresh
+        active, idle = self.watched(), [repo for repo in self.repos if repo in self.inactive]
+        if self.listed != (active, idle):  # a repo came or went, or changed groups: make the rows afresh
             for row in self.repo_rows.values():
                 row.destroy()
-            self.repo_rows = {}
-            for repo in self.repos:
+            self.repo_rows, self.listed = {}, (active, idle)
+            for repo in active + idle:
                 owner, _, name = short(repo).rpartition("/")
                 self.repo_rows[repo] = self.side_row(
-                    self.repo_list, self.dot("open-dot", 8), name, sub=owner,
-                    click=lambda repo=repo: self.pick_repo(repo),
-                    menu=lambda event, repo=repo: self.pop_repo_menu([repo], event))
+                    self.idle_list if repo in self.inactive else self.repo_list, self.dot("open-dot", 8), name,
+                    sub=owner, click=lambda repo=repo: self.pick_repo(repo),
+                    menu=lambda event, repo=repo: self.pop_repo_menu([repo], event),
+                    name="Idle.Name" if repo in self.inactive else "Name")
         for repo, row in self.repo_rows.items():
             rows = self.rows.get(repo)
             # Its health: grey until first polled, orange if the last poll failed, red if a PR needs attention.
+            # An inactive repo has none: a hollow ring.
             health = ("err-dot" if repo in self.failed else "open-dot" if rows is None else
                       "bad-dot" if any(v in VIEWS["attention"]["verdicts"] for _, v in rows) else "ok-dot")
-            row.icon.configure(image=self.dot(health, 8))
+            row.icon.configure(image=self.ring("faint", 8) if repo in self.inactive else self.dot(health, 8))
             row.count.configure(text="" if rows is None else len(rows))
             self.lit(row, repo == self.only)
+        self.idle_head.pack_forget()
+        self.idle_list.pack_forget()
+        if idle:
+            self.idle_head.pack(fill="x", pady=(18, 4), after=self.repo_list)
+            self.idle_fold.configure(image=self.icon("down" if self.inactive_open else "right", "muted", 12))
+            self.idle_count.configure(text=len(idle))
+            if self.inactive_open:
+                self.idle_list.pack(fill="x", after=self.idle_head)
         if self.adding or not self.repos:
             self.add_entry.pack(fill="x", padx=8, pady=(0, 6), after=self.repo_head)
         else:
@@ -2411,6 +2457,12 @@ class App:
         self.only = None if self.only == repo else repo  # a second click shows every repo again
         self.render()
 
+    def toggle_inactive(self):
+        """Fold the sidebar's inactive repos away to their heading, or list them again."""
+        self.inactive_open = not self.inactive_open
+        self.show_sidebar()
+        self.save()
+
     def toggle_add(self, on=None):
         self.adding = not self.adding if on is None else on
         self.render()
@@ -2471,15 +2523,27 @@ class App:
 
         threading.Thread(target=run, daemon=True).start()
 
+    def watched(self):
+        """The repos that are polled: all but the inactive ones."""
+        return [repo for repo in self.repos if repo not in self.inactive]
+
+    def watching(self, repo):
+        """Whether repo is polled: it's listed, and it isn't inactive. Workers ask as they go, so a poll that's
+        under way when a repo is removed or set inactive stops short of it."""
+        return repo in self.repos and repo not in self.inactive
+
     def add_repo(self, target):
         try:
             repo = resolve(target)
         except Exception as e:
             self.events.put(("tell", "unadded", target, e))
             return self.log(f"can't add {target}: {e!r}")
+        self.events.put(("wake", repo))  # asked for by name: if it's listed as inactive, it's watched again
         self.show(repo)
 
     def refresh(self, repo):
+        if repo in self.inactive:
+            return
         details, started = {}, time.monotonic()
         try:  # show it now; merge on the next tick
             rows = poll(repo, self.log, lambda: None, details)
@@ -2509,14 +2573,16 @@ class App:
         for kind, title, body in found:
             if kind == "merged":  # counted whether or not it's announced
                 self.events.put(("merged", repo))
-            if self.notify.get(kind) and repo in self.repos:
+            if self.notify.get(kind) and self.watching(repo):
                 how = "notified" if notify(title, body) else "can't notify"
                 self.log(f"{repo}: {how}: {title} · {body.partition(' · ')[2]}")
 
     def poll_all(self, snapshot):
         try:
             for repo in snapshot:
-                mode = lambda repo=repo: self.live["mode"] if self.live["merging"] and repo in self.repos else None
+                if not self.watching(repo):  # removed or set inactive since the tick
+                    continue
+                mode = lambda repo=repo: self.live["mode"] if self.live["merging"] and self.watching(repo) else None
                 details, started = {}, time.monotonic()
                 rows = poll(repo, self.log, mode, details)
                 self.events.put(("prs", repo, rows, details))
@@ -2527,9 +2593,10 @@ class App:
             self.events.put(("done",))  # else busy stays set and polling stops for good
 
     def poll(self):
-        if self.repos and not self.busy:
+        watched = self.watched()
+        if watched and not self.busy:
             self.busy = True
-            self.bg(self.poll_all, list(self.repos))
+            self.bg(self.poll_all, watched)
 
     def poll_now(self):
         self.poll()
@@ -2570,7 +2637,9 @@ class App:
                 self.repos.append(rest[0])
                 self.save()
                 changed = True
-            elif kind == "prs" and rest[0] in self.repos:
+            elif kind == "wake":
+                self.set_active(rest, True)
+            elif kind == "prs" and self.watching(rest[0]):  # not a poll that was under way when it stopped being
                 repo, rows, details = rest
                 if rows is None:  # couldn't list them: keep showing the last list that could
                     self.failed.add(repo)
@@ -2615,6 +2684,7 @@ class App:
         for repo in repos:
             if repo in self.repos:
                 self.repos.remove(repo)
+                self.inactive.discard(repo)
                 self.rows.pop(repo, None)
                 self.details.pop(repo, None)
                 self.failed.discard(repo)
@@ -2622,6 +2692,24 @@ class App:
             self.only = None
         self.render()
         self.save()
+
+    def set_active(self, repos, on):
+        """Watch repos again, or stop watching them. An inactive repo stays listed, in a group of its own, and
+        isn't polled, merged or notified about until it's set active. What was known of its pull requests goes:
+        it would only grow stale."""
+        changed = [repo for repo in repos if repo in self.repos and (repo in self.inactive) == on]
+        for repo in changed:
+            if on:
+                self.inactive.discard(repo)
+                self.bg(self.show, repo)  # polled now, not at the next tick
+            else:
+                self.inactive.add(repo)
+                self.rows.pop(repo, None)
+                self.details.pop(repo, None)
+                self.failed.discard(repo)
+        if changed:
+            self.render()
+            self.save()
 
     def act_on(self, iids, action):
         """action(repo, number) for each PR row, off the Tk thread; then update their repos."""
@@ -2684,6 +2772,9 @@ class App:
 
     def pop_repo_menu(self, repos, event):
         self.menu_repos = repos
+        idle = [repo in self.inactive for repo in repos]  # each of the two is offered only when it'd do something
+        for label, on in (("Refresh", not all(idle)), ("Set inactive", not all(idle)), ("Set active", any(idle))):
+            self.repo_menu.entryconfigure(label, state="normal" if on else "disabled")
         self.repo_menu.tk_popup(event.x_root, event.y_root)
         return "break"
 
@@ -2742,7 +2833,9 @@ class App:
         if self.sidebar.winfo_width() > 1:  # it's 1 until the window is drawn
             self.sidebar_width = min(max(self.sidebar.winfo_width(), SIDEBAR[0]), SIDEBAR[1])
         try:
-            save_settings({"repos": self.repos, "mode": self.mode_var.get(), "interval": self.seconds(), **self.flagged,
+            save_settings({"repos": self.repos, "inactive": [repo for repo in self.repos if repo in self.inactive],
+                           "inactive_open": self.inactive_open,
+                           "mode": self.mode_var.get(), "interval": self.seconds(), **self.flagged,
                            "merging": self.merging.get(), "geometry": self.root.geometry(),
                            "detail": self.detail.measure(),
                            "appearance": self.appearance, "view": self.view, "sidebar": self.sidebar_width,
@@ -2849,6 +2942,8 @@ class Settings:
                    "cleared": ("Codex clears a pull request", "Useful while Auto-merge is off.")}
     TINTS = ("#4F46E5", "#0F766E", "#C2410C", "#7C3AED")  # a repo's tile is one of these, by its name
     REPO_NOTE = "Repos passed on the command line are added to this list. GitHub Enterprise hosts work too."
+    IDLE_NOTE = ("Inactive repos stay listed but aren't polled, merged or notified about. Switch one on to watch it"
+                 " again.")
 
     def __init__(self, app):
         self.app, root = app, app.root
@@ -3111,7 +3206,8 @@ class Settings:
         self.repo_list = ttk.Frame(card, style="Group.TFrame")
         self.repo_list.pack(fill="x")
         self.repo_rows = {}  # repo -> its row; show_repos() keeps them in step with the App's repos
-        self.trashed = 0  # when trash() last removed a repo, by time.monotonic()
+        self.listed = ([], [])  # the active and the inactive repos those rows were made for
+        self.moved = 0  # when a row was last removed or switched to the other list, by time.monotonic()
         self.asked, self.unknown = set(), set()  # the repos whose merge rights gh was asked for, and couldn't say
         form = ttk.Frame(card, style="Group.TFrame", padding=10)
         form.pack(fill="x")
@@ -3124,6 +3220,12 @@ class Settings:
         self.repo_note = ttk.Label(box, text=self.REPO_NOTE, style="Fineprint.TLabel", wraplength=self.WIDTH - 8,
                                    justify="left")
         self.repo_note.pack(anchor="w", padx=4, pady=(8, 0))
+        # The inactive repos, in a card of their own: show_repos() packs it while there are any.
+        self.idle_box = self.section(pane, "Inactive")
+        self.idle_list = ttk.Frame(self.card(self.idle_box), style="Group.TFrame")
+        self.idle_list.pack(fill="x")
+        ttk.Label(self.idle_box, text=self.IDLE_NOTE, style="Fineprint.TLabel", wraplength=self.WIDTH - 8,
+                  justify="left").pack(anchor="w", padx=4, pady=(8, 0))
         self.show_repos()
 
     def add(self, _event=None):
@@ -3136,14 +3238,20 @@ class Settings:
     def show_repos(self):
         """The repo list as the App has it now: each repo's open PRs, and whether gh's account can merge there."""
         app = self.app
-        if list(self.repo_rows) != app.repos:  # a repo came or went: make the rows afresh
+        active, idle = app.watched(), [repo for repo in app.repos if repo in app.inactive]
+        if self.listed != (active, idle):  # a repo came or went, or changed lists: make the rows afresh
             for row in self.repo_rows.values():
                 row.destroy()
-            self.repo_rows = {repo: self.repo_row(repo) for repo in app.repos}
+            self.listed = active, idle
+            self.repo_rows = {repo: self.repo_row(repo) for repo in active + idle}
+            self.idle_box.pack(fill="x", pady=(0, 22)) if idle else self.idle_box.pack_forget()
             if self.repo_list.winfo_ismapped():
                 self.fit()
         for repo, row in self.repo_rows.items():
             rows = app.rows.get(repo)
+            if repo in app.inactive:  # nothing is asked of gh about it, its merge rights included
+                row.note.configure(text="not polled")
+                continue
             row.note.configure(text="couldn't list its pull requests" if repo in app.failed else
                                "not polled yet" if rows is None else f"{len(rows)} open")
             if repo in app.rights:
@@ -3156,16 +3264,29 @@ class Settings:
                 self.asked.add(repo)
                 app.bg(lambda repo=repo: app.events.put(("tell", "rights", repo, can_merge(repo))))
 
+    def settled(self):
+        """Whether the rows have stayed put for a moment. A row that's removed or switched to the other list makes
+        the rest close up, so a double click's second click would land on the next repo's control and act on that
+        too."""
+        still = time.monotonic() - self.moved >= 0.6
+        if still:
+            self.moved = time.monotonic()
+        return still
+
     def trash(self, repo):
-        """Remove repo. Not within a moment of the last removal: the rows close up, so a double click's second click
-        would land on the next repo's button and take that too."""
-        if time.monotonic() - self.trashed >= 0.6:
-            self.trashed = time.monotonic()
+        if self.settled():
             self.app.remove([repo])
+
+    def toggle(self, repo):
+        """Set repo inactive, or active again: its switch was thrown."""
+        if self.settled():
+            self.app.set_active([repo], repo in self.app.inactive)
+        elif repo in self.repo_rows:  # not acted on: the switch goes back to what's so
+            self.repo_rows[repo].on.set(repo not in self.app.inactive)
 
     def repo_row(self, repo):
         app = self.app
-        row = ttk.Frame(self.repo_list, style="Group.TFrame")
+        row = ttk.Frame(self.idle_list if repo in app.inactive else self.repo_list, style="Group.TFrame")
         row.pack(fill="x")
         ttk.Frame(row, style="GroupRule.TFrame", height=1).pack(side="bottom", fill="x")
         line = ttk.Frame(row, style="Group.TFrame", padding=(14, 9, 9, 9))
@@ -3179,9 +3300,15 @@ class Settings:
         row.note = ttk.Label(line, style="Muted.Group.TLabel")
         row.note.grid(row=1, column=1, sticky="w")
         row.badge = ttk.Label(line, compound="left")
-        row.badge.grid(row=0, column=2, rowspan=2, padx=(12, 6))
+        if repo not in app.inactive:
+            row.badge.grid(row=0, column=2, rowspan=2, padx=(12, 6))
+        row.on = tk.BooleanVar(value=repo not in app.inactive)  # its switch: on while the repo is watched
+        row.switch = ttk.Checkbutton(line, variable=row.on, style="Group.Switch.TCheckbutton", takefocus=False,
+                                     image=(app.switch(False), "selected", app.switch(True)),
+                                     command=lambda: self.toggle(repo))
+        row.switch.grid(row=0, column=3, rowspan=2, padx=(6, 8))
         ttk.Button(line, image=app.icon("trash", "muted", 14), style="Group.TButton", takefocus=False,
-                   command=lambda: self.trash(repo)).grid(row=0, column=3, rowspan=2)
+                   command=lambda: self.trash(repo)).grid(row=0, column=4, rowspan=2)
         return row
 
     def build_merging(self, pane):

@@ -1468,12 +1468,14 @@ class Test(unittest.TestCase):
 
     def test_settings_round_trip(self):
         with tempfile.TemporaryDirectory() as d, mock.patch.object(ca, "CONFIG", f"{d}/sub/s.json"):
-            self.assertEqual(ca.load_settings(), {"repos": [], "mode": "", "interval": 60,
+            self.assertEqual(ca.load_settings(), {"repos": [], "inactive": [], "inactive_open": True,
+                                                  "mode": "", "interval": 60,
                                                   "merging": True, "geometry": None, "detail": 320,
                                                   "appearance": "system",
                                                   "view": "all", "sidebar": 232, "log": True,
                                                   "notify": dict.fromkeys(ca.NOTIFY_KINDS, True), "menubar": True})
-            saved = {"repos": [REPO], "mode": "admin", "interval": 5, "merging": False, "geometry": "800x600+0+0",
+            saved = {"repos": [REPO], "inactive": [REPO], "inactive_open": False,
+                     "mode": "admin", "interval": 5, "merging": False, "geometry": "800x600+0+0",
                      "detail": 400,
                      "appearance": "dark", "view": "attention", "sidebar": 300, "log": False,
                      "notify": dict(dict.fromkeys(ca.NOTIFY_KINDS, True), cleared=False), "menubar": False}
@@ -1948,6 +1950,153 @@ class Test(unittest.TestCase):
         self.assertEqual(ca.FirstRun.CHECKS, ("GitHub CLI installed", "Signed in"))  # as setup_checks() titles them
         with mock.patch.object(ca, "gh", self.answering({})):
             self.assertEqual(tuple(title for _, title, _ in ca.setup_checks()), ca.FirstRun.CHECKS)
+
+    def test_inactive_setting_round_trips_and_falls_back(self):
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(ca, "CONFIG", f"{d}/s.json"):
+            idle = lambda: [ca.load_settings()[key] for key in ("inactive", "inactive_open")]
+            ca.save_settings({"repos": ["h/a/b", "h/c/d", "h/e/f"], "inactive": ["h/e/f", "h/a/b"],
+                              "inactive_open": False})
+            self.assertEqual(idle(), [["h/a/b", "h/e/f"], False])  # in the repo list's order
+            # Only a listed repo can be inactive: anything else would be a repo no list shows, never polled.
+            for bad in (["h/x/y"], "h/a/b", {"h/a/b": True}, [["h/a/b"]], [1], None, 3):
+                pathlib.Path(ca.CONFIG).write_text(json.dumps({"repos": ["h/a/b"], "inactive": bad}))
+                self.assertEqual(idle(), [[], True], bad)
+            for bad in ("no", 0, None):  # only false folds the group away
+                pathlib.Path(ca.CONFIG).write_text(json.dumps({"inactive_open": bad}))
+                self.assertIs(ca.load_settings()["inactive_open"], True, bad)
+
+    def repo_menu(self, app):
+        """Open the repo menu on the sidebar's row for REPO; return its entries' states by label."""
+        import tkinter as tk
+        with mock.patch.object(tk.Menu, "tk_popup", autospec=True):  # a real popup is modal on macOS
+            app.pop_repo_menu([REPO], mock.Mock(x_root=0, y_root=0))
+        menu = app.repo_menu
+        return {menu.entrycget(i, "label"): menu.entrycget(i, "state")
+                for i in range(menu.index("end") + 1) if menu.type(i) == "command"}
+
+    def test_window_sets_a_repo_inactive_and_active_again(self):
+        fake = FakeGh(reactions=THUMBS)
+        listings = lambda: sum(args[:2] == ("pr", "list") for args, _ in fake.calls)
+
+        def check(root, tree, buttons, wait_for):
+            app = root.app
+            wait_for("Thumbs up")
+            counts = lambda: {str(row.count.cget("text")) for row in app.view_rows.values()}
+            group = lambda: (app.repo_rows[REPO].master, app.idle_head.winfo_manager(), app.idle_list.winfo_manager())
+            states = self.repo_menu(app)
+            self.assertEqual([states[label] for label in ("Refresh", "Set inactive", "Set active")],
+                             ["normal", "normal", "disabled"])
+            self.assertEqual(group(), (app.repo_list, "", ""))  # no group while nothing is inactive
+            polled, rows = listings(), app.rows[REPO]
+
+            # Inactive: still listed and saved, in its own group, with nothing of it in the table or the counts.
+            app.repo_menu.invoke("Set inactive")
+            self.assertEqual((app.repos, app.inactive, tree.exists(REPO), counts()), ([REPO], {REPO}, False, {"0"}))
+            self.assertEqual((self.saved()["repos"], self.saved()["inactive"]), ([REPO], [REPO]))
+            self.assertEqual(group(), (app.idle_list, "pack", "pack"))
+            self.assertEqual(str(app.idle_count.cget("text")), "1")
+            self.assertFalse(app.first_run.up)  # a repo that isn't polled is still a repo
+            states = self.repo_menu(app)
+            self.assertEqual([states[label] for label in ("Refresh", "Set inactive", "Set active")],
+                             ["disabled", "disabled", "normal"])
+
+            # Nothing polls it: not a tick, not Poll now, not a refresh, not a poll that was already under way.
+            app.poll_now()
+            self.assertFalse(app.busy)
+            app.refresh(REPO)
+            app.poll_all([REPO])
+            app.events.put(("prs", REPO, rows, {}))  # as from a poll that began before it was set inactive
+            self.until(root, app.events.empty, "drained the events")
+            root.update()
+            self.assertEqual((listings(), app.rows, tree.exists(REPO), fake.merges()), (polled, {}, False, []))
+
+            # Picked in the sidebar, it says why it's empty and offers to watch it again.
+            app.pick_repo(REPO)
+            self.assertEqual((app.subtitle.cget("text"), app.empty_title.cget("text"), app.wake_button.winfo_manager()),
+                             ("Inactive · not polled", "Inactive", "pack"))
+
+            # The group folds away to its heading, and that's saved.
+            app.idle_fold.invoke()
+            self.assertEqual((group(), self.saved()["inactive_open"]), ((app.idle_list, "pack", ""), False))
+            self.assertEqual(str(app.idle_count.cget("text")), "1")
+            app.idle_fold.invoke()
+            self.assertEqual((group(), self.saved()["inactive_open"]), ((app.idle_list, "pack", "pack"), True))
+
+            # Active again: polled at once, and back among the watched.
+            app.wake_button.invoke()
+            wait_for("Thumbs up")
+            self.assertEqual((app.inactive, self.saved()["inactive"], listings()), (set(), [], polled + 1))
+            self.assertEqual(group(), (app.repo_list, "", ""))
+            self.assertEqual(app.wake_button.winfo_manager(), "")
+
+            # Adding an inactive repo by name is asking to watch it.
+            app.set_active([REPO], False)
+            app.new_repo.set("octo/direct-repo")
+            app.add()
+            wait_for("Thumbs up")
+            self.assertEqual((app.repos, app.inactive), ([REPO], set()))
+
+        self.window(fake, check)
+
+    def test_inactive_repos_are_not_polled_from_launch(self):
+        fake = FakeGh(reactions=THUMBS)
+
+        def check(root, tree, buttons, wait_for):
+            app = root.app
+            self.until(root, lambda: app.repos == [REPO], "listed the saved repo")
+            root.update()
+            self.assertEqual((app.inactive, app.first_run.up, tree.exists(REPO)), ({REPO}, False, False))
+            app.poll_now()
+            self.until(root, app.events.empty, "drained the events")
+            self.assertEqual([args for args, _ in fake.calls if args[0] == "pr"], [])
+            # Folded away, as saved: the heading and its count, without the rows.
+            self.assertEqual((app.idle_head.winfo_manager(), app.idle_list.winfo_manager(),
+                              str(app.idle_count.cget("text"))), ("pack", "", "1"))
+            self.assertEqual((app.empty_title.cget("text"), app.empty_text.cget("text")),
+                             ("Nothing is polled", "Every repository is inactive."))
+
+        gui = ca.gui
+        with tempfile.TemporaryDirectory() as d, \
+                mock.patch.object(ca, "gui", lambda targets, mode, interval: gui([], mode, interval)):
+            config = f"{d}/s.json"
+            pathlib.Path(config).write_text(json.dumps({"repos": [REPO], "inactive": [REPO], "inactive_open": False}))
+            self.window(fake, check, config=config)
+
+    def test_settings_window_switches_a_repo_inactive_and_back(self):
+        asked = mock.Mock(return_value=True)
+
+        def check(root, tree, buttons, wait_for):
+            app = root.app
+            wait_for("Thumbs up")
+            app.set_active([REPO], False)
+            app.settings()
+            prefs = app.prefs
+            prefs.pane.set("repos")
+            prefs.show_pane()
+            root.update()
+            look = lambda: (prefs.repo_rows[REPO].master, prefs.repo_rows[REPO].on.get(),
+                            prefs.repo_rows[REPO].note.cget("text"), prefs.repo_rows[REPO].badge.winfo_manager(),
+                            prefs.idle_box.winfo_manager())
+            # In the card of its own, switched off, and gh isn't asked what its account may do there.
+            self.assertEqual(look(), (prefs.idle_list, False, "not polled", "", "pack"))
+            asked.assert_not_called()
+            prefs.repo_rows[REPO].switch.invoke()
+            wait_for("Thumbs up")
+            self.until(root, lambda: prefs.repo_rows[REPO].badge.cget("text") == "Can merge", "showed merge rights")
+            self.assertEqual(look(), (prefs.repo_list, True, "1 open", "grid", ""))
+            self.assertEqual((app.inactive, self.saved()["inactive"]), (set(), []))
+            # A double click's second click isn't a second switch: the rows have just closed up under it.
+            prefs.moved = time.monotonic()  # as the first click left it, however long the poll above took
+            prefs.repo_rows[REPO].switch.invoke()
+            self.assertEqual((app.inactive, prefs.repo_rows[REPO].on.get()), (set(), True))
+            prefs.moved = 0  # a moment later
+            prefs.repo_rows[REPO].switch.invoke()
+            self.assertEqual(look(), (prefs.idle_list, False, "not polled", "", "pack"))
+            self.assertEqual((app.inactive, self.saved()["inactive"]), ({REPO}, [REPO]))
+
+        with mock.patch.object(ca, "can_merge", asked):
+            self.window(FakeGh(reactions=THUMBS), check)
+
 
 if __name__ == "__main__":
     unittest.main()
