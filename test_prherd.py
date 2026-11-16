@@ -2049,6 +2049,19 @@ class Test(unittest.TestCase):
             app.refresh(REPO)
             self.assertEqual(self.notified.call_args_list, [mock.call("Codex cleared #7", "octo/direct-repo · t")])
 
+            # Failed lookups are counted afresh too: one from before isn't the first of the two that are news.
+            failing = [(rows[0][0], "?")]
+            self.notified.reset_mock()
+            app.notice(REPO, time.monotonic(), failing, app.epochs[REPO])
+            app.set_active([REPO], False)
+            with mock.patch.object(app, "bg"):
+                app.set_active([REPO], True)
+            app.notice(REPO, time.monotonic(), failing, app.epochs[REPO])
+            self.notified.assert_not_called()
+            app.notice(REPO, time.monotonic(), failing, app.epochs[REPO])
+            self.assertEqual(self.notified.call_args_list,
+                             [mock.call("Lookup failed for #7", "octo/direct-repo · t")])
+
             # Nor is what an old poll learns once its epoch has passed: here, that #7 merged, while gh is asked.
             def state(repo, number):
                 app.set_active([REPO], False)

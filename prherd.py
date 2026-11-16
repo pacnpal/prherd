@@ -2601,6 +2601,8 @@ class App:
                 return
             if self.based.get(repo, epoch) != epoch:  # the first list since it was last watched: nothing to compare
                 self.seen.pop(repo, None)
+                for key in [key for key in self.streaks if key[0] == repo]:  # nor failed lookups to count on from
+                    del self.streaks[key]
             found = notices(repo, self.seen.get(repo), rows, self.streaks, state=pr_state)
             if epoch != self.epochs.get(repo, 0):  # passed while notices() asked gh about the PRs that left
                 return
