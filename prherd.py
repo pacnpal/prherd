@@ -1756,6 +1756,9 @@ class App:
         self.repos = []
         # The repos that are listed but not polled, until set active again. Workers read it: see watching().
         self.inactive, self.inactive_open = set(saved["inactive"]), saved["inactive_open"]
+        # repo -> how often it has stopped or started being watched. A poll belongs to the epoch it began in, and
+        # what it finds once that has passed is dropped: its list is from before, and no news of what came after.
+        self.epochs = {}
         self.rows = {}  # repo -> [(pr, verdict)] from its last poll that could list them
         self.failed = set()  # the repos whose latest poll couldn't
         self.prs = {}  # tree row -> its PR as of the last poll
@@ -2544,11 +2547,11 @@ class App:
     def refresh(self, repo):
         if repo in self.inactive:
             return
-        details, started = {}, time.monotonic()
+        details, started, epoch = {}, time.monotonic(), self.epochs.get(repo, 0)
         try:  # show it now; merge on the next tick
             rows = poll(repo, self.log, lambda: None, details)
-            self.events.put(("prs", repo, rows, details))
-            self.notice(repo, started, rows)
+            self.events.put(("prs", repo, rows, details, epoch))
+            self.notice(repo, started, rows, epoch)
         except Exception as e:
             self.log(f"{repo}: poll crashed; retrying next interval ({e!r})")
 
@@ -2558,13 +2561,15 @@ class App:
             self.seen.pop(repo, None)
         self.refresh(repo)
 
-    def notice(self, repo, started, rows):
+    def notice(self, repo, started, rows, epoch):
         """Post the notifications a poll of repo is worth, and count its merges. The poll began at started, by
-        time.monotonic(). This runs gh (notices() asks about each PR that left the list), so on a worker thread."""
+        time.monotonic(), in that epoch of the repo's (see self.epochs). This runs gh (notices() asks about each
+        PR that left the list), so on a worker thread."""
         with self.noticing:  # a tick's poll and a refresh can have the same repo at once
             # A list older than the one last compared would bring back a PR that merged in between, to be
-            # announced again when it next went.
-            if started < self.newest.get(repo, 0):
+            # announced again when it next went. One from before the repo was last set inactive or active would
+            # be compared with the next, and what happened while it wasn't watched announced.
+            if epoch != self.epochs.get(repo, 0) or started < self.newest.get(repo, 0):
                 return
             found = notices(repo, self.seen.get(repo), rows, self.streaks, state=pr_state)
             if rows is not None:  # a listing that failed is no list to compare the next one with
@@ -2583,10 +2588,10 @@ class App:
                 if not self.watching(repo):  # removed or set inactive since the tick
                     continue
                 mode = lambda repo=repo: self.live["mode"] if self.live["merging"] and self.watching(repo) else None
-                details, started = {}, time.monotonic()
+                details, started, epoch = {}, time.monotonic(), self.epochs.get(repo, 0)
                 rows = poll(repo, self.log, mode, details)
-                self.events.put(("prs", repo, rows, details))
-                self.notice(repo, started, rows)
+                self.events.put(("prs", repo, rows, details, epoch))
+                self.notice(repo, started, rows, epoch)
         except Exception as e:  # e.g. gh missing; log it rather than kill the thread silently
             self.log(f"poll crashed; retrying next interval ({e!r})")
         finally:
@@ -2639,8 +2644,9 @@ class App:
                 changed = True
             elif kind == "wake":
                 self.set_active(rest, True)
-            elif kind == "prs" and self.watching(rest[0]):  # not a poll that was under way when it stopped being
-                repo, rows, details = rest
+            # Not from a poll that was under way when the repo stopped being watched, or started again.
+            elif kind == "prs" and self.watching(rest[0]) and rest[3] == self.epochs.get(rest[0], 0):
+                repo, rows, details, _ = rest
                 if rows is None:  # couldn't list them: keep showing the last list that could
                     self.failed.add(repo)
                 else:
@@ -2684,6 +2690,7 @@ class App:
         for repo in repos:
             if repo in self.repos:
                 self.repos.remove(repo)
+                self.epochs[repo] = self.epochs.get(repo, 0) + 1
                 self.inactive.discard(repo)
                 self.rows.pop(repo, None)
                 self.details.pop(repo, None)
@@ -2699,6 +2706,7 @@ class App:
         it would only grow stale."""
         changed = [repo for repo in repos if repo in self.repos and (repo in self.inactive) == on]
         for repo in changed:
+            self.epochs[repo] = self.epochs.get(repo, 0) + 1  # before the poll below begins: it's of the new one
             if on:
                 self.inactive.discard(repo)
                 self.bg(self.show, repo)  # polled now, not at the next tick

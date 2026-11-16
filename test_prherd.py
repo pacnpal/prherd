@@ -409,7 +409,7 @@ class Test(unittest.TestCase):
 
             # A poll that began before the one last compared is too old to compare: #8 isn't back, to merge again.
             fake.merged = ()
-            app.notice(REPO, 0, ca.poll(REPO, lambda msg: None, lambda: None))
+            app.notice(REPO, 0, ca.poll(REPO, lambda msg: None, lambda: None), 0)
             self.assertEqual(sorted(app.seen[REPO]), [7])
             fake.merged = (8,)
             app.refresh(REPO)
@@ -1987,7 +1987,7 @@ class Test(unittest.TestCase):
             self.assertEqual([states[label] for label in ("Refresh", "Set inactive", "Set active")],
                              ["normal", "normal", "disabled"])
             self.assertEqual(group(), (app.repo_list, "", ""))  # no group while nothing is inactive
-            polled, rows = listings(), app.rows[REPO]
+            polled, rows, epoch = listings(), app.rows[REPO], app.epochs.get(REPO, 0)
 
             # Inactive: still listed and saved, in its own group, with nothing of it in the table or the counts.
             app.repo_menu.invoke("Set inactive")
@@ -2005,7 +2005,7 @@ class Test(unittest.TestCase):
             self.assertFalse(app.busy)
             app.refresh(REPO)
             app.poll_all([REPO])
-            app.events.put(("prs", REPO, rows, {}))  # as from a poll that began before it was set inactive
+            app.events.put(("prs", REPO, rows, {}, epoch))  # as from a poll that began before it was set inactive
             self.until(root, app.events.empty, "drained the events")
             root.update()
             self.assertEqual((listings(), app.rows, tree.exists(REPO), fake.merges()), (polled, {}, False, []))
@@ -2028,6 +2028,25 @@ class Test(unittest.TestCase):
             self.assertEqual((app.inactive, self.saved()["inactive"], listings()), (set(), [], polled + 1))
             self.assertEqual(group(), (app.repo_list, "", ""))
             self.assertEqual(app.wake_button.winfo_manager(), "")
+
+            # A poll from before it was set inactive that ends once it's active again is still too old. Its list
+            # isn't shown, and isn't what the first poll since is compared with: what happened while the repo
+            # wasn't watched is no news.
+            app.set_active([REPO], False)
+            with mock.patch.object(app, "refresh"):  # the poll on setting it active hasn't begun
+                with mock.patch.object(app, "bg", lambda fn, *args: fn(*args)):
+                    app.set_active([REPO], True)
+                before = [(rows[0][0], None)]  # as that old poll found it: not yet cleared by Codex
+                app.events.put(("prs", REPO, [], {}, epoch))
+                app.notice(REPO, time.monotonic(), before, epoch)
+            self.assertNotIn(REPO, app.seen)
+            app.refresh(REPO)
+            self.until(root, app.events.empty, "drained the events")
+            self.notified.assert_not_called()
+            self.assertEqual(([v for _, v in app.rows[REPO]], sorted(app.seen[REPO])), (["👍"], [7]))
+            app.notice(REPO, time.monotonic(), before, app.epochs[REPO])  # whereas one of this epoch is compared
+            app.refresh(REPO)
+            self.assertEqual(self.notified.call_args_list, [mock.call("Codex cleared #7", "octo/direct-repo · t")])
 
             # Adding an inactive repo by name is asking to watch it.
             app.set_active([REPO], False)
