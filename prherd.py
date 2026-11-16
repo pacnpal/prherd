@@ -2566,12 +2566,12 @@ class App:
         """For a poll of repo that's about to begin: the repo's epoch, and a function saying whether that's still
         its epoch. False once the repo is set inactive or removed, and from then on, whatever is done with it."""
         epoch = self.epochs.get(repo, 0)
-        return epoch, lambda: epoch == self.epochs.get(repo, 0)
+        return epoch, lambda: epoch == self.epochs.get(repo, 0) and repo not in self.inactive
 
     def refresh(self, repo, asked=None):
         """Poll repo now, without merging, and show what's found. asked is the repo's epoch when this was asked
         for, if it was for later: by the time it runs the repo may have been removed, or set inactive."""
-        details, started, (epoch, live) = {}, time.monotonic(), self.epoch_of(repo)
+        details, started, (epoch, live) = {}, time.monotonic(), self.epoch_of(repo)  # before the check: see poll_all()
         if repo in self.inactive or asked not in (None, epoch):
             return
         try:  # show it now; merge on the next tick
@@ -2619,10 +2619,12 @@ class App:
     def poll_all(self, snapshot):
         try:
             for repo in snapshot:
+                # Its epoch first, then whether it's watched: a repo removed or set inactive between the two is
+                # caught by one or the other, where the other order would poll it in its new epoch.
+                details, started, (epoch, live) = {}, time.monotonic(), self.epoch_of(repo)
                 if not self.watching(repo):  # removed or set inactive since the tick
                     continue
                 mode = lambda repo=repo: self.live["mode"] if self.live["merging"] and self.watching(repo) else None
-                details, started, (epoch, live) = {}, time.monotonic(), self.epoch_of(repo)
                 rows = poll(repo, self.log, mode, details, live)
                 self.events.put(("prs", repo, rows, details, epoch))
                 self.notice(repo, started, rows, epoch)

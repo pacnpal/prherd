@@ -2097,6 +2097,17 @@ class Test(unittest.TestCase):
             wait_for("Thumbs up")
             self.assertEqual((app.repos, app.inactive), ([REPO], set()))
 
+            # Set inactive just as a tick's poll gets to it, before the poll has its epoch: still not polled.
+            def late(repo, epoch_of=app.epoch_of):
+                app.set_active([REPO], False)
+                return epoch_of(repo)
+
+            polled = listings()
+            with mock.patch.object(app, "epoch_of", late):
+                app.poll_all([REPO])
+            self.assertEqual((app.inactive, listings()), ({REPO}, polled))
+            self.assertFalse(app.epoch_of(REPO)[1]())  # and no poll of an inactive repo is one to carry on with
+
         self.window(fake, check)
 
     def test_inactive_repos_are_not_polled_from_launch(self):
