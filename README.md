@@ -82,7 +82,13 @@ work too).
   one of its PRs needs attention, orange when its last poll failed, and grey until its first poll. Click a repo to
   list only its PRs, and again to list them all.
 - **+**: opens a field. Type `owner/repo` or a path and press Enter. You can monitor any number of repos at once.
-- **Right-click a repo** (here or in the list): Open in browser, Copy link, Refresh (without merging), and Remove repo.
+- **Right-click a repo** (here or in the list): Open in browser, Copy link, Refresh (without merging), Set inactive,
+  Set active, and Remove repo.
+- **Inactive**: the repos you've set inactive, in a group of their own under the watched ones. An inactive repo
+  stays in your list but isn't polled, merged or notified about, and its PRs leave the list and the counts. Click
+  the group's heading to fold it away to that one line, and again to list them. To watch one again, right-click it
+  and choose Set active, or click it and press **Set active**. It's polled right away. Adding an inactive repo by
+  name does the same.
 - At the bottom: the account `gh` is signed in as, and the button that opens [Settings](#settings).
 
 **Pull requests**
@@ -161,7 +167,8 @@ The window follows the system's light or dark appearance, and switches within a 
 system does. To pin it, choose Light or Dark in [Settings](#settings) (in the settings file below, that's
 `"appearance"` set to `"light"` or `"dark"`; `"system"` is the default).
 
-The window saves its repo list, merge mode, interval, Auto-merge setting,
+The window saves its repo list, which of them are inactive and whether that group is folded away, merge mode,
+interval, Auto-merge setting,
 appearance, size, chosen view, sidebar and detail panel widths, whether the activity log is
 collapsed, the notification switches, and whether to show the menu bar item to `$XDG_CONFIG_HOME/prherd.json`
 (default `~/.config/prherd.json`) whenever one changes and when you close it,
@@ -183,7 +190,8 @@ the toolbar's own controls: change either and the other follows.
   is, with a button that shows it in Finder (in Explorer on Windows; on Linux it opens the folder).
 - **Repositories**: the watched repos, with add and remove. Each has a badge for whether the account `gh` is
   signed in as can merge there (admin, maintain or write permission): Can merge, Can't merge, or Unknown if `gh`
-  couldn't say.
+  couldn't say. Each also has a switch: off sets the repo inactive and moves it to the Inactive card below, and on
+  brings it back.
 - **Merging**: the Auto-merge switch, the three merge modes with what each does, and the rules that aren't
   settings: squash pinned to the head commit, the `do-not-merge` label, one conflict comment per head commit.
 - **Codex**: the account that counts as Codex, what counts as a go-ahead, and the `@codex review` comment that
