@@ -2049,6 +2049,36 @@ class Test(unittest.TestCase):
             app.refresh(REPO)
             self.assertEqual(self.notified.call_args_list, [mock.call("Codex cleared #7", "octo/direct-repo · t")])
 
+            # Nor is what an old poll learns once its epoch has passed: here, that #7 merged, while gh is asked.
+            def state(repo, number):
+                app.set_active([REPO], False)
+                with mock.patch.object(app, "bg"):
+                    app.set_active([REPO], True)
+                return {"state": "MERGED", "title": "t", "number": number}
+
+            self.notified.reset_mock()
+            merged, seen = app.merged, dict(app.seen[REPO])
+            with mock.patch.object(ca, "pr_state", state):
+                app.notice(REPO, time.monotonic(), [], app.epochs[REPO])
+            self.until(root, app.events.empty, "drained the events")
+            self.notified.assert_not_called()
+            self.assertEqual((app.merged, app.seen[REPO]), (merged, seen))
+            app.refresh(REPO)
+
+            # Set active and removed before its poll began: that poll doesn't run, and doesn't list it again.
+            app.set_active([REPO], False)
+            polled = listings()
+            with mock.patch.object(app, "bg") as later:
+                app.set_active([REPO], True)
+            app.remove([REPO])
+            later.call_args.args[0](*later.call_args.args[1:])
+            self.until(root, app.events.empty, "drained the events")
+            root.update()
+            self.assertEqual((app.repos, self.saved()["repos"], listings()), ([], [], polled))
+            app.new_repo.set("octo/direct-repo")
+            app.add()
+            wait_for("Thumbs up")
+
             # A poll is told when its repo stops being watched as it was, and that holds if it's watched again.
             with mock.patch.object(ca, "poll", return_value=None) as polled:
                 app.poll_all([REPO])
@@ -2125,6 +2155,11 @@ class Test(unittest.TestCase):
         self.assertEqual([args[2] for args in fake.merges()], ["7"])
         self.assertEqual(logs[-1], f"{REPO}: no longer watched; skipping the rest of this poll")
         self.assertEqual(ca.kind_of(logs[-1]), "poll")
+        fake, answers, logs = FakeGh(mergeable="CONFLICTING"), iter([True, True, False]), []
+        with mock.patch.object(ca, "gh", fake):  # listed, #7, then not its conflict comment: the lookups took a while
+            ca.poll(REPO, logs.append, lambda: "", live=lambda: next(answers, False))
+        self.assertEqual((fake.comments_posted(), logs[-1]),
+                         ([], f"  {REPO}#7: merge conflict; no longer watched, not commenting"))
 
     def test_merge_is_not_started_once_its_repo_is_no_longer_watched(self):
         pr = {"number": 7, "headRefOid": HEAD}

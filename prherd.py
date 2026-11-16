@@ -220,8 +220,9 @@ def cancel_auto_merge(repo, pr):
     return "cancelled queued auto-merge" if not r.returncode else f"cancelling auto-merge FAILED: {output(r)}"
 
 
-def flag_conflict(repo, pr):
-    """Comment once per head commit that the PR has merge conflicts."""
+def flag_conflict(repo, pr, live=lambda: True):
+    """Comment once per head commit that the PR has merge conflicts. live() is asked before commenting: False
+    once the repo is no longer watched as it was when the poll began."""
     host, nwo = repo.split("/", 1)
     marker = CONFLICT.format(pr["headRefOid"])
     try:
@@ -232,6 +233,8 @@ def flag_conflict(repo, pr):
     # Only our own comment counts: anyone else posting the marker would silence the notice.
     if any((c.get("user") or {}).get("id") == me and marker in (c.get("body") or "") for c in comments):
         return "merge conflict; already commented"
+    if not live():  # set inactive or removed while the comments were fetched
+        return "merge conflict; no longer watched, not commenting"
     # No @codex here: that would ask Codex for a review.
     r = gh("pr", "comment", str(pr["number"]), "-R", repo, "--body",
            f"This pull request has merge conflicts with `{pr['baseRefName']}`. "
@@ -245,8 +248,8 @@ def poll(repo, log, merge_mode, details=None, live=lambda: True):
     merge_mode() is asked right before each merge: the mode to merge with, or None to skip.
     Conflicting PRs are commented on either way, unless marked don't merge.
     details, if a dict, gets {number: verdict_detail()} for each PR whose verdict was looked up.
-    live() is asked once the PRs are listed, before each one and before each merge command: False cuts the pass
-    short, for a repo that was set inactive or removed while it ran.
+    live() is asked once the PRs are listed, before each one, and before each conflict comment and merge command:
+    False cuts the pass short, for a repo that was set inactive or removed while it ran.
     """
     try:
         # shortcut: PRs past the 1000th open one are never seen; page through the API if a repo gets there.
@@ -274,7 +277,7 @@ def poll(repo, log, merge_mode, details=None, live=lambda: True):
         # UNKNOWN (GitHub still computing it) falls through; the next poll sees the answer.
         if pr.get("mergeable") == "CONFLICTING":  # a merge would fail; say so on the PR instead
             rows.append((pr, "merge conflict"))
-            log(f"{tag}: {flag_conflict(repo, pr)}")
+            log(f"{tag}: {flag_conflict(repo, pr, live)}")
             continue
         try:
             detail = verdict_detail(repo, pr)
@@ -2565,10 +2568,12 @@ class App:
         epoch = self.epochs.get(repo, 0)
         return epoch, lambda: epoch == self.epochs.get(repo, 0)
 
-    def refresh(self, repo):
-        if repo in self.inactive:
-            return
+    def refresh(self, repo, asked=None):
+        """Poll repo now, without merging, and show what's found. asked is the repo's epoch when this was asked
+        for, if it was for later: by the time it runs the repo may have been removed, or set inactive."""
         details, started, (epoch, live) = {}, time.monotonic(), self.epoch_of(repo)
+        if repo in self.inactive or asked not in (None, epoch):
+            return
         try:  # show it now; merge on the next tick
             rows = poll(repo, self.log, lambda: None, details, live)
             self.events.put(("prs", repo, rows, details, epoch))
@@ -2597,10 +2602,14 @@ class App:
             if self.based.get(repo, epoch) != epoch:  # the first list since it was last watched: nothing to compare
                 self.seen.pop(repo, None)
             found = notices(repo, self.seen.get(repo), rows, self.streaks, state=pr_state)
+            if epoch != self.epochs.get(repo, 0):  # passed while notices() asked gh about the PRs that left
+                return
             if rows is not None:  # a listing that failed is no list to compare the next one with
                 self.newest[repo], self.based[repo] = started, epoch
                 self.seen[repo] = {pr["number"]: (pr, v) for pr, v in rows}
         for kind, title, body in found:
+            if epoch != self.epochs.get(repo, 0):  # each one takes a while to post
+                return
             if kind == "merged":  # counted whether or not it's announced
                 self.events.put(("merged", repo))
             if self.notify.get(kind) and self.watching(repo):
@@ -2734,7 +2743,8 @@ class App:
             self.epochs[repo] = self.epochs.get(repo, 0) + 1  # before the poll below begins: it's of the new one
             if on:
                 self.inactive.discard(repo)
-                self.bg(self.show, repo)  # polled now, not at the next tick
+                # Polled now, not at the next tick: unless it's removed or set inactive again before that runs.
+                self.bg(self.refresh, repo, self.epochs[repo])
             else:
                 self.inactive.add(repo)
                 self.rows.pop(repo, None)
