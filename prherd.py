@@ -150,13 +150,18 @@ def dont_merge(pr):
     return any(label["name"].lower() == DONT_MERGE for label in pr["labels"])
 
 
-def merge(repo, pr, mode):
+def merge(repo, pr, mode, live=lambda: True):
+    """Squash merge pr at the head the poll saw. live() is asked before each merge command: False once the repo
+    is no longer watched as it was when the poll began."""
     # The poll's list can be a while old by now, and a merge can't be taken back.
     try:
         if dont_merge(gh_json("pr", "view", str(pr["number"]), "-R", repo, "--json", "labels")):
             return "marked don't merge; not merging"
     except (RuntimeError, ValueError) as e:
         return f"failed to re-check labels; not merging, retrying ({e})"
+    stopped = "no longer watched; not merging"
+    if not live():  # set inactive or removed while the labels were looked up
+        return stopped
     args = ["pr", "merge", str(pr["number"]), "-R", repo, "--squash",
             "--match-head-commit", pr["headRefOid"]]
     if not mode:
@@ -167,6 +172,8 @@ def merge(repo, pr, mode):
         # merging now, so a conflict or a failing required check still stops us.
         if not re.search(r"auto.?merge", output(r), re.I):
             return f"MERGE FAILED: {output(r)}"
+        if not live():
+            return stopped
     r = gh(*args, *(["--admin"] if mode == "admin" else []))
     if r.returncode:
         return f"MERGE FAILED: {output(r)}"
@@ -232,12 +239,14 @@ def flag_conflict(repo, pr):
     return "merge conflict; commented on the PR" if not r.returncode else f"merge conflict; comment FAILED: {output(r)}"
 
 
-def poll(repo, log, merge_mode, details=None):
-    """One pass over repo's open PRs. Returns [(pr, verdict)], or None if listing failed.
+def poll(repo, log, merge_mode, details=None, live=lambda: True):
+    """One pass over repo's open PRs. Returns [(pr, verdict)], or None if listing failed or the pass was cut short.
 
     merge_mode() is asked right before each merge: the mode to merge with, or None to skip.
     Conflicting PRs are commented on either way, unless marked don't merge.
     details, if a dict, gets {number: verdict_detail()} for each PR whose verdict was looked up.
+    live() is asked once the PRs are listed, before each one and before each merge command: False cuts the pass
+    short, for a repo that was set inactive or removed while it ran.
     """
     try:
         # shortcut: PRs past the 1000th open one are never seen; page through the API if a repo gets there.
@@ -247,10 +256,15 @@ def poll(repo, log, merge_mode, details=None):
     except (RuntimeError, ValueError) as e:
         log(f"{repo}: failed to list open PRs; retrying ({e})")
         return None
+    if not live():
+        return None
     log(f"{repo}: {len(prs)} open PR(s)")
     rows = []
     for pr in prs:
         tag = f"  {repo}#{pr['number']}"
+        if not live():  # nothing more is asked of it or done to it: not a comment, not a merge
+            log(f"{repo}: no longer watched; skipping the rest of this poll")
+            return None
         if dont_merge(pr):
             rows.append((pr, "don't merge"))
             log(f"{tag}: marked don't merge; skipping")
@@ -278,7 +292,7 @@ def poll(repo, log, merge_mode, details=None):
             log(f"{tag}: no 👍 or clean review yet")
         elif (mode := merge_mode()) is not None:
             log(f"{tag}: {v} — squash merging")
-            log(f"{tag}: {merge(repo, pr, mode)}")
+            log(f"{tag}: {merge(repo, pr, mode, live)}")
     return rows
 
 
@@ -1756,8 +1770,9 @@ class App:
         self.repos = []
         # The repos that are listed but not polled, until set active again. Workers read it: see watching().
         self.inactive, self.inactive_open = set(saved["inactive"]), saved["inactive_open"]
-        # repo -> how often it has stopped or started being watched. A poll belongs to the epoch it began in, and
-        # what it finds once that has passed is dropped: its list is from before, and no news of what came after.
+        # repo -> how often it has stopped or started being watched. A poll belongs to the epoch it began in. Once
+        # that has passed it's cut short (see epoch_of()) and what it found is dropped: its list is from before, and
+        # no news of what came after.
         self.epochs = {}
         self.rows = {}  # repo -> [(pr, verdict)] from its last poll that could list them
         self.failed = set()  # the repos whose latest poll couldn't
@@ -1768,6 +1783,7 @@ class App:
         self.appearance = saved["appearance"]
         # What notice() compares each poll with. Workers keep these, one at a time: whoever holds self.noticing.
         self.seen, self.streaks, self.newest, self.noticing = {}, {}, {}, threading.Lock()
+        self.based = {}  # repo -> the epoch its list in self.seen is of
         self.merged = ("", {})  # see merged_today()
         self.menubar, self.status = saved["menubar"], None  # the setting, and the menu bar item while there is one
         self.dark = None  # the palette in use; None until the first theme()
@@ -2541,24 +2557,31 @@ class App:
         except Exception as e:
             self.events.put(("tell", "unadded", target, e))
             return self.log(f"can't add {target}: {e!r}")
-        self.events.put(("wake", repo))  # asked for by name: if it's listed as inactive, it's watched again
-        self.show(repo)
+        self.show(repo, wake=True)  # asked for by name: if it's listed as inactive, it's watched again
+
+    def epoch_of(self, repo):
+        """For a poll of repo that's about to begin: the repo's epoch, and a function saying whether that's still
+        its epoch. False once the repo is set inactive or removed, and from then on, whatever is done with it."""
+        epoch = self.epochs.get(repo, 0)
+        return epoch, lambda: epoch == self.epochs.get(repo, 0)
 
     def refresh(self, repo):
         if repo in self.inactive:
             return
-        details, started, epoch = {}, time.monotonic(), self.epochs.get(repo, 0)
+        details, started, (epoch, live) = {}, time.monotonic(), self.epoch_of(repo)
         try:  # show it now; merge on the next tick
-            rows = poll(repo, self.log, lambda: None, details)
+            rows = poll(repo, self.log, lambda: None, details, live)
             self.events.put(("prs", repo, rows, details, epoch))
             self.notice(repo, started, rows, epoch)
         except Exception as e:
             self.log(f"{repo}: poll crashed; retrying next interval ({e!r})")
 
-    def show(self, repo):
+    def show(self, repo, wake=False):
+        """List repo, if it isn't, and poll it. With wake, set it active first if it's inactive: after it's
+        listed, since a saved repo's own listing may not have come yet."""
         self.events.put(("repo", repo))
-        with self.noticing:  # newly watched, or watched again: what its PRs did while it wasn't is no news
-            self.seen.pop(repo, None)
+        if wake:
+            self.events.put(("wake", repo))
         self.refresh(repo)
 
     def notice(self, repo, started, rows, epoch):
@@ -2571,9 +2594,11 @@ class App:
             # be compared with the next, and what happened while it wasn't watched announced.
             if epoch != self.epochs.get(repo, 0) or started < self.newest.get(repo, 0):
                 return
+            if self.based.get(repo, epoch) != epoch:  # the first list since it was last watched: nothing to compare
+                self.seen.pop(repo, None)
             found = notices(repo, self.seen.get(repo), rows, self.streaks, state=pr_state)
             if rows is not None:  # a listing that failed is no list to compare the next one with
-                self.newest[repo] = started
+                self.newest[repo], self.based[repo] = started, epoch
                 self.seen[repo] = {pr["number"]: (pr, v) for pr, v in rows}
         for kind, title, body in found:
             if kind == "merged":  # counted whether or not it's announced
@@ -2588,8 +2613,8 @@ class App:
                 if not self.watching(repo):  # removed or set inactive since the tick
                     continue
                 mode = lambda repo=repo: self.live["mode"] if self.live["merging"] and self.watching(repo) else None
-                details, started, epoch = {}, time.monotonic(), self.epochs.get(repo, 0)
-                rows = poll(repo, self.log, mode, details)
+                details, started, (epoch, live) = {}, time.monotonic(), self.epoch_of(repo)
+                rows = poll(repo, self.log, mode, details, live)
                 self.events.put(("prs", repo, rows, details, epoch))
                 self.notice(repo, started, rows, epoch)
         except Exception as e:  # e.g. gh missing; log it rather than kill the thread silently

@@ -2029,27 +2029,39 @@ class Test(unittest.TestCase):
             self.assertEqual(group(), (app.repo_list, "", ""))
             self.assertEqual(app.wake_button.winfo_manager(), "")
 
-            # A poll from before it was set inactive that ends once it's active again is still too old. Its list
-            # isn't shown, and isn't what the first poll since is compared with: what happened while the repo
-            # wasn't watched is no news.
+            # What its pull requests did while it wasn't watched is no news, whichever poll is the first since.
+            # Not the one begun on setting it active, here held back: this refresh gets in ahead of it, and the
+            # list from before isn't what it's compared with.
+            before = [(rows[0][0], None)]  # #7 as it was last seen: not yet cleared by Codex
+            app.notice(REPO, time.monotonic(), before, app.epochs[REPO])
+            epoch = app.epochs[REPO]
             app.set_active([REPO], False)
-            with mock.patch.object(app, "refresh"):  # the poll on setting it active hasn't begun
-                with mock.patch.object(app, "bg", lambda fn, *args: fn(*args)):
-                    app.set_active([REPO], True)
-                before = [(rows[0][0], None)]  # as that old poll found it: not yet cleared by Codex
-                app.events.put(("prs", REPO, [], {}, epoch))
-                app.notice(REPO, time.monotonic(), before, epoch)
-            self.assertNotIn(REPO, app.seen)
+            with mock.patch.object(app, "bg"):
+                app.set_active([REPO], True)
+            # Nor a poll from before it was set inactive that only ends now: its list isn't shown or compared.
+            app.events.put(("prs", REPO, [], {}, epoch))
+            app.notice(REPO, time.monotonic(), before, epoch)
             app.refresh(REPO)
             self.until(root, app.events.empty, "drained the events")
             self.notified.assert_not_called()
             self.assertEqual(([v for _, v in app.rows[REPO]], sorted(app.seen[REPO])), (["👍"], [7]))
-            app.notice(REPO, time.monotonic(), before, app.epochs[REPO])  # whereas one of this epoch is compared
+            app.notice(REPO, time.monotonic(), before, app.epochs[REPO])  # whereas a list of this epoch is compared
             app.refresh(REPO)
             self.assertEqual(self.notified.call_args_list, [mock.call("Codex cleared #7", "octo/direct-repo · t")])
 
-            # Adding an inactive repo by name is asking to watch it.
+            # A poll is told when its repo stops being watched as it was, and that holds if it's watched again.
+            with mock.patch.object(ca, "poll", return_value=None) as polled:
+                app.poll_all([REPO])
+            live = polled.call_args.args[4]
+            self.assertTrue(live())
             app.set_active([REPO], False)
+            self.assertFalse(live())
+            with mock.patch.object(app, "bg"):
+                app.set_active([REPO], True)
+            self.assertFalse(live())
+            app.set_active([REPO], False)
+
+            # Adding an inactive repo by name is asking to watch it.
             app.new_repo.set("octo/direct-repo")
             app.add()
             wait_for("Thumbs up")
@@ -2080,6 +2092,50 @@ class Test(unittest.TestCase):
             config = f"{d}/s.json"
             pathlib.Path(config).write_text(json.dumps({"repos": [REPO], "inactive": [REPO], "inactive_open": False}))
             self.window(fake, check, config=config)
+
+    def test_a_repo_passed_at_launch_is_watched_though_saved_inactive(self):
+        def check(root, tree, buttons, wait_for):
+            wait_for("Thumbs up")
+            self.assertEqual((root.app.repos, root.app.inactive, self.saved()["inactive"]), ([REPO], set(), []))
+
+        with tempfile.TemporaryDirectory() as d:
+            config = f"{d}/s.json"
+            pathlib.Path(config).write_text(json.dumps({"repos": [REPO], "inactive": [REPO]}))
+            self.window(FakeGh(reactions=THUMBS), check, config=config)
+
+        def unlisted(root, tree, buttons, wait_for):  # the launch's own listing of it hasn't come: listed, then woken
+            app = root.app
+            app.inactive.add(REPO)
+            with mock.patch.object(app, "refresh"):
+                app.show(REPO, wake=True)
+            wait_for("Thumbs up")
+            self.assertEqual((app.repos, app.inactive), ([REPO], set()))
+
+        self.bare_window(FakeGh(reactions=THUMBS), unlisted)
+
+    def test_poll_is_cut_short_once_its_repo_is_no_longer_watched(self):
+        # GUI: set inactive or removed while this poll was running. Nothing more is asked of the repo or done to it.
+        fake = FakeGh(reactions=THUMBS, mergeable="CONFLICTING", more=[{"number": 8}])
+        with mock.patch.object(ca, "gh", fake):
+            self.assertIsNone(ca.poll(REPO, lambda _: None, lambda: "", live=lambda: False))
+        self.assertEqual([args[:2] for args, _ in fake.calls], [("pr", "list")])
+        fake, answers, logs = FakeGh(reactions=THUMBS, more=[{"number": 8}]), iter([True, True, True, False]), []
+        with mock.patch.object(ca, "gh", fake):  # listed, #7, #7's merge, then not #8
+            self.assertIsNone(ca.poll(REPO, logs.append, lambda: "", live=lambda: next(answers)))
+        self.assertEqual([args[2] for args in fake.merges()], ["7"])
+        self.assertEqual(logs[-1], f"{REPO}: no longer watched; skipping the rest of this poll")
+        self.assertEqual(ca.kind_of(logs[-1]), "poll")
+
+    def test_merge_is_not_started_once_its_repo_is_no_longer_watched(self):
+        pr = {"number": 7, "headRefOid": HEAD}
+        fake = FakeGh()  # while the labels were re-checked
+        with mock.patch.object(ca, "gh", fake):
+            self.assertEqual(ca.merge(REPO, pr, "", live=lambda: False), "no longer watched; not merging")
+        self.assertEqual(fake.merges(), [])
+        fake, answers = FakeGh(merge=(1, "auto-merge is not allowed for this repository")), iter([True, False])
+        with mock.patch.object(ca, "gh", fake):  # or while --auto was refused: no falling back to merging now
+            self.assertEqual(ca.merge(REPO, pr, "", live=lambda: next(answers)), "no longer watched; not merging")
+        self.assertEqual([args[-1] for args in fake.merges()], ["--auto"])
 
     def test_settings_window_switches_a_repo_inactive_and_back(self):
         asked = mock.Mock(return_value=True)
