@@ -1243,6 +1243,24 @@ class Test(unittest.TestCase):
                 self.window(fake, check)
             self.assertEqual(fake.merges(), [pinned(7, HEAD) + flags, pinned(9, other) + flags], mode)
 
+    def test_merge_now_stops_for_a_repo_set_inactive_since(self):
+        fake = FakeGh(reactions=THUMBS)
+
+        def check(root, tree, buttons, wait_for):
+            app = root.app
+            wait_for("Thumbs up")
+            tree.selection_set(ROW)
+            app.merge_now()
+            with mock.patch.object(app, "bg") as later:  # confirmed, but its worker hasn't got to the merge
+                app.sheet.merge_button.invoke()
+            app.set_active([REPO], False)
+            later.call_args.args[0](*later.call_args.args[1:])
+            self.logged(root, "no longer watched; not merging")
+
+        with mock.patch.object(ca.MergeSheet, "ARMED", 0):
+            self.window(fake, check)
+        self.assertEqual(fake.merges(), [])
+
     def test_merge_sheet_cancels_unless_merge_has_the_focus(self):
         fake = FakeGh(reactions=THUMBS)
 

@@ -2788,9 +2788,12 @@ class App:
         # The PRs as shown when asked, so a push after that makes GitHub refuse (--match-head-commit).
         chosen = {iid: self.prs[iid] for iid in self.mergeable_now()}
         mode = "admin" if self.live["mode"] == "admin" else "force"
+        def go():  # a repo set inactive or removed once this is asked for isn't merged in, as with a poll's merges
+            live = {repo: self.epoch_of(repo)[1] for repo in {iid.rsplit("#", 1)[0] for iid in chosen}}
+            self.act_on(list(chosen), lambda repo, number: merge(repo, chosen[f"{repo}#{number}"], mode, live[repo]))
+
         if chosen:  # the sheet asks; nothing merges unless its Merge button is chosen
-            MergeSheet(self, chosen, mode, lambda: self.act_on(
-                list(chosen), lambda repo, number: merge(repo, chosen[f"{repo}#{number}"], mode)))
+            MergeSheet(self, chosen, mode, go)
 
     def open_in_browser(self, iids):
         for iid in iids:
